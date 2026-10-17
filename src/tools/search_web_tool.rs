@@ -3,7 +3,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::{config::Config, tools::Tool, types::ToolError};
+use crate::{
+    config::{Config, SearchProvider},
+    tools::Tool,
+    types::ToolError,
+};
 
 pub struct SearchWebTool {
     config: Arc<Config>,
@@ -26,7 +30,7 @@ impl Tool for SearchWebTool {
             "type": "function",
             "function": {
                 "name": self.name(),
-                "description": "Search the web using Brave Search API.
+                "description": "Search the web using the configured search provider.
                             Use this to find relevant URLs and snippets for a research question. 
                             Pass a concise search query of 3-7 words. Returns titles, URLs, and 
                             snippets but NOT full page content. Use fetch_url separately to read 
@@ -65,6 +69,21 @@ pub async fn search_web(
     query: &str,
     count: usize,
 ) -> Result<Value, ToolError> {
+    if query.trim().is_empty() {
+        return Err(ToolError::NonRetryable(
+            "query must not be empty".to_string(),
+        ));
+    }
+    let count = count.clamp(1, 10);
+    match config.search_provider {
+        SearchProvider::Parallel => return config.parallel_search.search(query, count).await,
+        SearchProvider::None => {
+            return Err(ToolError::NonRetryable(
+                "web search is disabled".to_string(),
+            ));
+        }
+        SearchProvider::Brave => {}
+    }
     let url = format!(
         "https://api.search.brave.com/res/v1/web/search?q={}&count={}",
         urlencoding::encode(query),
