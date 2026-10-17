@@ -48,7 +48,8 @@ impl Default for AgentConfig {
 
 pub struct SearchAgent {
     config: Arc<Config>,
-    registry: ToolRegistry,
+    #[cfg(test)]
+    pub(crate) model_endpoint: String,
     agent_config: AgentConfig,
 }
 
@@ -58,17 +59,19 @@ impl SearchAgent {
     }
 
     pub fn with_agent_config(config: Arc<Config>, agent_config: AgentConfig) -> Self {
-        let registry = ToolRegistry::from_config(config.clone());
-
         Self {
             config,
             agent_config,
-            registry,
+            #[cfg(test)]
+            model_endpoint: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+                .into(),
         }
     }
 
     pub async fn run(&self, question: &str) -> anyhow::Result<AgentRunResult> {
         let run_start = Instant::now();
+        // Each independent history owns its tools and immutable search identity.
+        let registry = ToolRegistry::from_config(self.config.clone());
 
         info!(
             max_iterations = self.agent_config.max_iterations,
@@ -143,7 +146,10 @@ impl SearchAgent {
 
             let gemini_start = Instant::now();
 
-            let api_response = match self.call_model_with_retry(&system_prompt, &messages).await {
+            let api_response = match self
+                .call_model_with_retry(&system_prompt, &messages, &registry)
+                .await
+            {
                 Ok((response, retries)) => {
                     let gemini_ms = gemini_start.elapsed().as_millis() as u64;
                     metrics.record_model_call(gemini_ms, retries);
@@ -283,7 +289,7 @@ impl SearchAgent {
                         serde_json::from_str(tc["function"]["arguments"].as_str().unwrap_or("{}"))
                             .unwrap_or_else(|_| json!({}));
 
-                    let registry = &self.registry;
+                    let registry = &registry;
                     let agent_config = &self.agent_config;
                     let urls_fetched = metrics.urls_fetched;
 
@@ -383,6 +389,7 @@ impl SearchAgent {
         &self,
         system: &str,
         messages: &[Value],
+        registry: &ToolRegistry,
     ) -> anyhow::Result<(Value, u32)> {
         let mut attempt = 0u32;
         let mut last_err = String::new();
@@ -411,7 +418,7 @@ impl SearchAgent {
 
             attempt += 1;
 
-            let result = self.call_model_once(system, messages).await;
+            let result = self.call_model_once(system, messages, registry).await;
 
             match result {
                 Ok(response) => {
@@ -452,11 +459,16 @@ impl SearchAgent {
         }
     }
 
-    async fn call_model_once(&self, system: &str, messages: &[Value]) -> anyhow::Result<Value> {
+    async fn call_model_once(
+        &self,
+        system: &str,
+        messages: &[Value],
+        registry: &ToolRegistry,
+    ) -> anyhow::Result<Value> {
         let mut full_messages = vec![json!({ "role": "system", "content": system })];
         full_messages.extend_from_slice(messages);
 
-        let tools = self.registry.descriptions();
+        let tools = registry.descriptions();
 
         let request_body = json!({
             "model":       MODEL_NAME,
@@ -472,10 +484,14 @@ impl SearchAgent {
             "sending request to Gemini"
         );
 
+        #[cfg(not(test))]
+        let endpoint = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
+        #[cfg(test)]
+        let endpoint = &self.model_endpoint;
         let response = self
             .config
             .http_client
-            .post("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
+            .post(endpoint)
             .header(
                 "Authorization",
                 format!("Bearer {}", self.config.gemini_api_key),

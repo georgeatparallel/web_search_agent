@@ -14,11 +14,12 @@ use tokio::{
 };
 
 use crate::{
+    agent::SearchAgent,
     config::{Config, MODEL_NAME, SearchProvider, USER_AGENT},
     parallel_search::{ENDPOINT, ParallelSearchClient},
     structured::build_search_report,
     tools::{Tool, search_web_tool::SearchWebTool, tool_registry::ToolRegistry},
-    types::{ToolCall, ToolError, ToolResult},
+    types::{TerminationReason, ToolCall, ToolError, ToolResult},
 };
 
 #[derive(Clone, Debug)]
@@ -60,6 +61,13 @@ impl Drop for Server {
 
 impl Server {
     async fn start(handler: impl Fn(&Request) -> Reply + Send + Sync + 'static) -> Self {
+        Self::start_gated(handler, None).await
+    }
+
+    async fn start_gated(
+        handler: impl Fn(&Request) -> Reply + Send + Sync + 'static,
+        model_gate: Option<Arc<tokio::sync::Barrier>>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -70,6 +78,7 @@ impl Server {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let captured = captured.clone();
                 let handler = handler.clone();
+                let model_gate = model_gate.clone();
                 tokio::spawn(async move {
                     let mut bytes = Vec::new();
                     let (headers, body_start) = loop {
@@ -108,6 +117,13 @@ impl Server {
                     };
                     captured.lock().unwrap().push(request.clone());
                     let reply = handler(&request);
+                    // Synchronize each model round so both runs' first searches
+                    // finish before either run can make its second search.
+                    if request.line.contains("/model ") {
+                        if let Some(gate) = model_gate {
+                            gate.wait().await;
+                        }
+                    }
                     let kind = if reply.sse {
                         "text/event-stream"
                     } else {
@@ -189,7 +205,16 @@ fn config(selection: Option<&str>, key: Option<&str>) -> Config {
 }
 
 fn local_config(server: &Server, timeout: Duration) -> Config {
-    let mut config = config(None, None);
+    local_config_with_selection(server, timeout, None, None)
+}
+
+fn local_config_with_selection(
+    server: &Server,
+    timeout: Duration,
+    selection: Option<&str>,
+    key: Option<&str>,
+) -> Config {
+    let mut config = config(selection, key);
     let client = reqwest::Client::builder()
         .no_proxy()
         .timeout(timeout)
@@ -693,4 +718,271 @@ async fn result_cap_and_anonymous_quota_error_are_preserved() {
         .unwrap_err();
     assert!(matches!(error, ToolError::Retryable(_)));
     assert!(error.to_string().contains("Anonymous quota exceeded"));
+}
+
+// These fixtures run the public agent loop with scripted model HTTP responses.
+// They make real local HTTP requests; no Gemini inference is involved.
+fn agent_reply(request: &Request) -> Reply {
+    if request.line.contains("/page?") {
+        return Reply {
+            status: 200,
+            body: "<p>Run-specific source content.</p>".into(),
+            sse: false,
+            hold_open: false,
+        };
+    }
+    if !request.line.contains("/model ") {
+        return normal_reply(request, results());
+    }
+    assert_eq!(request.body["model"], MODEL_NAME);
+    let messages = request.body["messages"].as_array().unwrap();
+    let question = messages[1]["content"].as_str().unwrap();
+    let tool_messages: Vec<_> = messages.iter().filter(|m| m["role"] == "tool").collect();
+    let disabled = request.body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|t| t["function"]["name"] != "search_web");
+    if disabled {
+        assert!(
+            messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Web search is disabled")
+        );
+    }
+    let call = |id: &str, name: &str, args: Value| {
+        json!({
+            "id": id, "type":"function", "function":{"name":name,"arguments":args.to_string()}
+        })
+    };
+    let choice = match tool_messages.len() {
+        0 => json!({"finish_reason":"tool_calls", "message":{"role":"assistant", "tool_calls":[
+            call("first", "search_web", json!({"query":format!("{question} first")}))
+        ]}}),
+        1 => {
+            let host = request
+                .headers
+                .lines()
+                .find_map(|line| line.strip_prefix("host: "))
+                .unwrap();
+            json!({"finish_reason":"tool_calls", "message":{"role":"assistant", "tool_calls":[
+                call("second", "search_web", json!({"query":format!("{question} second")})),
+                call("page", "fetch_url", json!({"url":format!("http://{host}/page?run={question}")}))
+            ]}})
+        }
+        3 => {
+            // Assert actual tool outcomes were consumed into this run's history.
+            for (i, m) in tool_messages.iter().enumerate() {
+                let result: Value = serde_json::from_str(m["content"].as_str().unwrap()).unwrap();
+                if i < 2 {
+                    if disabled || question == "brave" {
+                        assert_eq!(result["status"], "error");
+                    } else {
+                        assert_eq!(result["status"], "success");
+                        let suffix = if i == 0 { "first" } else { "second" };
+                        assert_eq!(result["data"]["query"], format!("{question} {suffix}"));
+                        assert_eq!(result["data"]["results"][0]["title"], "Tokio");
+                    }
+                } else {
+                    assert_eq!(result["status"], "success");
+                    assert!(
+                        result["data"]["content"]
+                            .as_str()
+                            .unwrap()
+                            .contains("Run-specific source")
+                    );
+                }
+            }
+            json!({"finish_reason":"stop", "message":{"role":"assistant", "content":"Answer from the run's sources."}})
+        }
+        n => panic!("unexpected scripted history length: {n}"),
+    };
+    Reply::json(json!({"choices":[choice]}))
+}
+
+fn local_agent(config: Arc<Config>, server: &Server) -> SearchAgent {
+    let mut agent = SearchAgent::new(config);
+    agent.model_endpoint = server.endpoint.replace("/mcp", "/model");
+    agent
+}
+
+async fn complete_run(agent: &SearchAgent, question: &str) {
+    let result = tokio::time::timeout(Duration::from_secs(5), agent.run(question))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        result.termination_reason,
+        TerminationReason::Completed
+    ));
+    assert_eq!(result.tool_calls.len(), 3);
+    let report = result.report.unwrap();
+    assert_eq!(
+        report.search_queries,
+        vec![format!("{question} first"), format!("{question} second")]
+    );
+    assert_eq!(report.sources.len(), 1);
+    assert!(
+        report.sources[0]
+            .url
+            .ends_with(&format!("/page?run={question}"))
+    );
+}
+
+fn assert_run_identities(server: &Server, interleaved: bool) {
+    let requests = server.snapshot();
+    let calls: Vec<_> = requests
+        .iter()
+        .filter(|r| r.body["method"] == "tools/call")
+        .collect();
+    assert_eq!(calls.len(), 4);
+    let mut identities = Vec::new();
+    for question in ["alpha", "beta"] {
+        let related: Vec<_> = calls
+            .iter()
+            .filter(|r| {
+                r.body["params"]["arguments"]["objective"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(question)
+            })
+            .collect();
+        assert_eq!(related.len(), 2);
+        let id = related[0].body["params"]["arguments"]["session_id"]
+            .as_str()
+            .unwrap();
+        assert!(uuid::Uuid::parse_str(id).is_ok());
+        assert_eq!(related[1].body["params"]["arguments"]["session_id"], id);
+        identities.push(id.to_string());
+    }
+    assert_ne!(identities[0], identities[1]);
+    if interleaved {
+        assert!(calls[..2].iter().all(|r| {
+            r.body["params"]["arguments"]["objective"]
+                .as_str()
+                .unwrap()
+                .ends_with("first")
+        }));
+        assert!(calls[2..].iter().all(|r| {
+            r.body["params"]["arguments"]["objective"]
+                .as_str()
+                .unwrap()
+                .ends_with("second")
+        }));
+    }
+    // The shared transport still initializes once, with project headers and no key.
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.body["method"] == "initialize")
+            .count(),
+        1
+    );
+    for r in requests.iter().filter(|r| r.line == "POST /mcp HTTP/1.1") {
+        let headers = r.headers.to_lowercase();
+        assert!(headers.contains("user-agent: websearchagent/1.0"));
+        assert!(!headers.contains("authorization:"));
+        assert!(!headers.contains("x-subscription-token:"));
+    }
+    // fetch_url remains direct HTTP, without MCP accounting or session headers.
+    let fetches: Vec<_> = requests
+        .iter()
+        .filter(|r| r.line.starts_with("GET /page?"))
+        .collect();
+    assert_eq!(fetches.len(), 2);
+    assert!(
+        fetches
+            .iter()
+            .all(|r| !r.headers.to_lowercase().contains("mcp-session-id:"))
+    );
+}
+
+#[tokio::test]
+async fn sequential_agent_runs_have_distinct_identities_and_within_run_continuity() {
+    let server = Server::start(agent_reply).await;
+    let agent = local_agent(
+        local_config(&server, Duration::from_secs(2)).into_arc(),
+        &server,
+    );
+    complete_run(&agent, "alpha").await;
+    complete_run(&agent, "beta").await;
+    assert_run_identities(&server, false);
+}
+
+#[tokio::test]
+async fn interleaved_runs_on_one_agent_keep_their_own_identities() {
+    let server =
+        Server::start_gated(agent_reply, Some(Arc::new(tokio::sync::Barrier::new(2)))).await;
+    let agent = local_agent(
+        local_config(&server, Duration::from_secs(2)).into_arc(),
+        &server,
+    );
+    tokio::join!(complete_run(&agent, "alpha"), complete_run(&agent, "beta"));
+    assert_run_identities(&server, true);
+}
+
+#[tokio::test]
+async fn interleaved_agents_sharing_config_keep_their_own_identities() {
+    let server =
+        Server::start_gated(agent_reply, Some(Arc::new(tokio::sync::Barrier::new(2)))).await;
+    let config = local_config_with_selection(
+        &server,
+        Duration::from_secs(2),
+        Some("parallel"),
+        Some("saved-brave-key"),
+    )
+    .into_arc();
+    let first = local_agent(config.clone(), &server);
+    let second = local_agent(config, &server);
+    tokio::join!(complete_run(&first, "alpha"), complete_run(&second, "beta"));
+    assert_run_identities(&server, true);
+}
+
+#[tokio::test]
+async fn agent_runs_preserve_configured_brave_and_disabled_search() {
+    for selection in [None, Some("brave"), Some("none")] {
+        let server = Server::start(|r| {
+            if r.line.starts_with("CONNECT ") {
+                return Reply {
+                    status: 401,
+                    body: String::new(),
+                    sse: false,
+                    hold_open: false,
+                };
+            }
+            agent_reply(r)
+        })
+        .await;
+        let mut config = local_config_with_selection(
+            &server,
+            Duration::from_secs(2),
+            selection,
+            Some("saved-brave-key"),
+        );
+        config.http_client = reqwest::Client::builder()
+            .no_proxy()
+            .proxy(reqwest::Proxy::https(&server.endpoint).unwrap())
+            .timeout(Duration::from_secs(2))
+            .user_agent(USER_AGENT)
+            .build()
+            .unwrap();
+        let agent = local_agent(config.into_arc(), &server);
+        complete_run(&agent, "brave").await;
+        let requests = server.snapshot();
+        assert!(requests.iter().all(|r| r.body["method"].is_null()));
+        let brave_calls: Vec<_> = requests
+            .iter()
+            .filter(|r| r.line.starts_with("CONNECT "))
+            .collect();
+        assert_eq!(
+            brave_calls.len(),
+            if selection == Some("none") { 0 } else { 2 }
+        );
+        assert!(
+            brave_calls
+                .iter()
+                .all(|r| r.line == "CONNECT api.search.brave.com:443 HTTP/1.1")
+        );
+    }
 }

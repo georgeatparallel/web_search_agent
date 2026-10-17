@@ -318,7 +318,10 @@ directly, including when search is disabled.
 
 The MCP client uses the existing 15-second HTTP request timeout, supports JSON
 and SSE responses, and stops in-flight requests when the caller cancels them.
-It reuses its MCP session and conversation identifier across searches.
+It reuses its MCP transport session across searches. Each `SearchAgent::run`
+gets a fresh conversation identifier, shared by searches within that run, even
+when runs overlap or agents share the same configuration. Page fetching stays
+on the existing direct HTTP path.
 
 ### Running the Agent
 

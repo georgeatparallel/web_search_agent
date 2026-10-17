@@ -24,8 +24,6 @@ pub(crate) struct ParallelSearchClient {
     endpoint: String,
     session: OnceCell<Session>,
     next_id: AtomicU64,
-    // Stable across calls, including retries and reinitialization.
-    conversation_id: String,
 }
 
 impl ParallelSearchClient {
@@ -35,7 +33,6 @@ impl ParallelSearchClient {
             endpoint: ENDPOINT.to_string(),
             session: OnceCell::new(),
             next_id: AtomicU64::new(1),
-            conversation_id: uuid::Uuid::new_v4().to_string(),
         }
     }
 
@@ -136,7 +133,12 @@ impl ParallelSearchClient {
         Ok(session)
     }
 
-    pub(crate) async fn search(&self, query: &str, count: usize) -> Result<Value, ToolError> {
+    pub(crate) async fn search(
+        &self,
+        query: &str,
+        count: usize,
+        conversation_id: &str,
+    ) -> Result<Value, ToolError> {
         let session = self.session.get_or_try_init(|| self.initialize()).await?;
         let result = self
             .rpc(
@@ -144,7 +146,7 @@ impl ParallelSearchClient {
                 json!({
                     "name":"web_search", "arguments": {
                         "objective": query, "search_queries":[query],
-                        "session_id":self.conversation_id, "model_name":MODEL_NAME
+                        "session_id":conversation_id, "model_name":MODEL_NAME
                     }
                 }),
                 Some(session),
